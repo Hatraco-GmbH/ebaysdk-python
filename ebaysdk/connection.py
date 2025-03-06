@@ -1,42 +1,56 @@
 # -*- coding: utf-8 -*-
 
-'''
+"""
 Copyright 2012-2019 eBay Inc.
 Authored by: Tim Keefer
 Licensed under CDDL 1.0
-'''
+"""
 
-from ebaysdk import log
-
+import datetime
 import re
 import time
 import uuid
 import webbrowser
-
-from requests import Request, Session
-from requests.adapters import HTTPAdapter
-
+from base64 import b64encode
+from hashlib import sha256
 from xml.dom.minidom import parseString
 from xml.parsers.expat import ExpatError
 
-from ebaysdk import set_stream_logger, UserAgent
-from ebaysdk.utils import getNodeText as getNodeTextUtils, smart_encode, smart_decode
-from ebaysdk.utils import getValue, smart_encode_request_data
-from ebaysdk.response import Response
+from Crypto.PublicKey import ECC
+from Crypto.Signature import eddsa
+from requests import Request, Session
+from requests.adapters import HTTPAdapter
+
+from ebaysdk import UserAgent, log, set_stream_logger
 from ebaysdk.exception import ConnectionError, ConnectionResponseError
+from ebaysdk.response import Response
+from ebaysdk.utils import getNodeText as getNodeTextUtils
+from ebaysdk.utils import (
+    getValue,
+    smart_decode,
+    smart_encode,
+)
 
 HTTP_SSL = {
-    False: 'http',
-    True: 'https',
+    False: "http",
+    True: "https",
 }
 
 
 class BaseConnection(object):
     """Base Connection Class."""
 
-    def __init__(self, debug=False, method='GET',
-                 proxy_host=None, timeout=20, proxy_port=80,
-                 parallel=None, escape_xml=False, **kwargs):
+    def __init__(
+        self,
+        debug=False,
+        method="GET",
+        proxy_host=None,
+        timeout=20,
+        proxy_port=80,
+        parallel=None,
+        escape_xml=False,
+        **kwargs,
+    ):
 
         if debug:
             set_stream_logger()
@@ -56,15 +70,12 @@ class BaseConnection(object):
 
         self.proxies = dict()
         if self.proxy_host:
-            proxy = 'http://%s:%s' % (self.proxy_host, self.proxy_port)
-            self.proxies = {
-                'http': proxy,
-                'https': proxy
-            }
+            proxy = "http://%s:%s" % (self.proxy_host, self.proxy_port)
+            self.proxies = {"http": proxy, "https": proxy}
 
         self.session = Session()
-        self.session.mount('http://', HTTPAdapter(max_retries=3))
-        self.session.mount('https://', HTTPAdapter(max_retries=3))
+        self.session.mount("http://", HTTPAdapter(max_retries=3))
+        self.session.mount("https://", HTTPAdapter(max_retries=3))
 
         self.parallel = parallel
 
@@ -74,7 +85,7 @@ class BaseConnection(object):
         self._reset()
 
     def debug_callback(self, debug_type, debug_message):
-        log.debug('type: ' + str(debug_type) + ' message' + str(debug_message))
+        log.debug("type: " + str(debug_type) + " message" + str(debug_message))
 
     def v(self, *args, **kwargs):
         return getValue(self.response.dict(), *args, **kwargs)
@@ -104,33 +115,40 @@ class BaseConnection(object):
         if verb:
             for i, v in enumerate(nodes):
                 if not nodes[i].startswith(verb.lower()):
-                    nodes[i] = "%sresponse.%s" % (
-                        verb.lower(), nodes[i].lower())
+                    nodes[i] = "%sresponse.%s" % (verb.lower(), nodes[i].lower())
 
-    def execute(self, verb, data=None, list_nodes=[], verb_attrs=None, files=None):
+    def execute(
+        self,
+        verb,
+        data=None,
+        list_nodes=[],
+        verb_attrs=None,
+        files=None,
+        signature=None,
+    ):
         "Executes the HTTP request."
-        log.debug('execute: verb=%s data=%s' % (verb, data))
+        log.debug("execute: verb=%s data=%s" % (verb, data))
 
         self._reset()
 
         self._list_nodes += list_nodes
         self._add_prefix(self._list_nodes, verb)
 
-        if hasattr(self, 'base_list_nodes'):
+        if hasattr(self, "base_list_nodes"):
             self._list_nodes += self.base_list_nodes
 
-        self.build_request(verb, data, verb_attrs, files)
+        self.build_request(verb, data, verb_attrs, signature, files)
         self.execute_request()
 
-        if hasattr(self.response, 'content'):
+        if hasattr(self.response, "content"):
             self.process_response()
             self.error_check()
 
-        log.debug('total time=%s' % (time.time() - self._time))
+        log.debug("total time=%s" % (time.time() - self._time))
 
         return self.response
 
-    def build_request(self, verb, data, verb_attrs, files=None):
+    def build_request(self, verb, data, verb_attrs, signature, files=None):
 
         self.verb = verb
         self._request_dict = data
@@ -139,8 +157,9 @@ class BaseConnection(object):
         url = self.build_request_url(verb)
 
         headers = self.build_request_headers(verb)
-        headers.update({'User-Agent': UserAgent,
-                        'X-EBAY-SDK-REQUEST-ID': str(self._request_id)})
+        headers.update(
+            {"User-Agent": UserAgent, "X-EBAY-SDK-REQUEST-ID": str(self._request_id)}
+        )
 
         # if we are adding files, we ensure there is no Content-Type header already defined
         # otherwise Request will use the existing one which is likely not to be multipart/form-data
@@ -148,16 +167,20 @@ class BaseConnection(object):
 
         requestData = self.build_request_data(verb, data, verb_attrs)
         if files:
-            del(headers['Content-Type'])
+            del headers["Content-Type"]
             if isinstance(requestData, str):  # pylint: disable-msg=E0602
-                requestData = {'XMLPayload': requestData}
+                requestData = {"XMLPayload": requestData}
 
-        request = Request(self.method,
-                          url,
-                          data=smart_encode_request_data(requestData),
-                          headers=headers,
-                          files=files,
-                          )
+        if signature:
+            headers = self.add_signature_headers(headers, signature, requestData)
+
+        request = Request(
+            self.method,
+            url,
+            data=requestData,
+            headers=headers,
+            files=files,
+        )
 
         self.request = request.prepare()
 
@@ -167,46 +190,92 @@ class BaseConnection(object):
     def build_request_data(self, verb, data, verb_attrs):
         return ""
 
+    def add_signature_headers(self, headers, signature, payload):
+        authority = self.config.get("domain", "api.ebay.com")
+        uri = self.config.get("uri", "/ws/api.dll")
+        timestamp = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+        content_digest = (
+            f'sha-256=:{b64encode(sha256(payload.encode("ascii")).digest()).decode()}:'
+        )
+
+        siginput = ['"x-ebay-signature-key"', '"@method"', '"@path"', '"@authority"']
+        siginput = ['"content-digest"'] + siginput
+        siginputstr = f'({" ".join(siginput)});created={timestamp}'
+
+        sigbase_dict = {
+            "content-digest": content_digest,
+            "x-ebay-signature-key": signature["jwe"],
+            "@method": "POST",
+            "@path": uri,
+            "@authority": authority,
+            "@signature-params": siginputstr,
+        }
+        sigbase = "\n".join(f'"{k}": {v}' for k, v in sigbase_dict.items())
+
+        build_key = f"-----BEGIN PRIVATE KEY-----\n{signature['private_key']}\n-----END PRIVATE KEY-----"
+        key = ECC.import_key(build_key)
+        signer = eddsa.new(key, mode="rfc8032")
+        signresult = signer.sign(sigbase.encode())
+
+        sig_header = {
+            "content-digest": content_digest,
+            "Signature-Input": f"sig1={siginputstr}",
+            "Signature": f"sig1=:{b64encode(signresult).decode()}:",
+            "x-ebay-signature-key": signature["jwe"],
+            "x-ebay-enforce-signature": "true",
+        }
+
+        for k, v in sig_header.items():
+            headers[k] = v
+
+        return headers
+
     def build_request_url(self, verb):
         url = "%s://%s%s" % (
-            HTTP_SSL[self.config.get('https', True)],
-            self.config.get('domain'),
-            self.config.get('uri')
+            HTTP_SSL[self.config.get("https", True)],
+            self.config.get("domain"),
+            self.config.get("uri"),
         )
         return url
 
     def execute_request(self):
 
-        log.debug("REQUEST (%s): %s %s"
-                  % (self._request_id, self.request.method, self.request.url))
-        log.debug('headers=%s' % self.request.headers)
-        log.debug('body=%s' % self.request.body)
+        log.debug(
+            "REQUEST (%s): %s %s"
+            % (self._request_id, self.request.method, self.request.url)
+        )
+        log.debug("headers=%s" % self.request.headers)
+        log.debug("body=%s" % self.request.body)
 
         if self.parallel:
             self.parallel._add_request(self)
             return None
 
-        self.response = self.session.send(self.request,
-                                          verify=True,
-                                          proxies=self.proxies,
-                                          timeout=self.timeout,
-                                          allow_redirects=True
-                                          )
+        self.response = self.session.send(
+            self.request,
+            verify=True,
+            proxies=self.proxies,
+            timeout=self.timeout,
+            allow_redirects=True,
+        )
 
-        log.debug('RESPONSE (%s):' % self._request_id)
-        log.debug('elapsed time=%s' % self.response.elapsed)
-        log.debug('status code=%s' % self.response.status_code)
-        log.debug('headers=%s' % self.response.headers)
-        log.debug('content=%s' % self.response.text)
+        log.debug("RESPONSE (%s):" % self._request_id)
+        log.debug("elapsed time=%s" % self.response.elapsed)
+        log.debug("status code=%s" % self.response.status_code)
+        log.debug("headers=%s" % self.response.headers)
+        log.debug("content=%s" % self.response.text)
 
     def process_response(self, parse_response=True):
         """Post processing of the response"""
 
-        self.response = Response(self.response,
-                                 verb=self.verb,
-                                 list_nodes=self._list_nodes,
-                                 datetime_nodes=self.datetime_nodes,
-                                 parse_response=parse_response)
+        self.response = Response(
+            self.response,
+            verb=self.verb,
+            list_nodes=self._list_nodes,
+            datetime_nodes=self.datetime_nodes,
+            parse_response=parse_response,
+        )
 
         self.session.close()
         # set for backward compatibility
@@ -218,7 +287,7 @@ class BaseConnection(object):
     def error_check(self):
         estr = self.error()
 
-        if estr and self.config.get('errors', True):
+        if estr and self.config.get("errors", True):
             log.error(estr)
             raise ConnectionError(estr, self.response)
 
@@ -246,8 +315,10 @@ class BaseConnection(object):
                 from bs4 import BeautifulStoneSoup
             except ImportError:
                 from BeautifulSoup import BeautifulStoneSoup
+
                 log.warning(
-                    'DeprecationWarning: BeautifulSoup 3 or earlier is deprecated; install bs4 instead\n')
+                    "DeprecationWarning: BeautifulSoup 3 or earlier is deprecated; install bs4 instead\n"
+                )
 
             self._response_soup = BeautifulStoneSoup(
                 smart_decode(self.response_content)
@@ -256,14 +327,14 @@ class BaseConnection(object):
         return self._response_soup
 
     def response_obj(self):
-        log.warning('response_obj() DEPRECATED, use response.reply instead')
+        log.warning("response_obj() DEPRECATED, use response.reply instead")
         return self.response.reply
 
     def response_dom(self):
-        """ Deprecated: use self.response.dom() instead
+        """Deprecated: use self.response.dom() instead
         Returns the response DOM (xml.dom.minidom).
         """
-        log.warning('response_dom() DEPRECATED, use response.dom instead')
+        log.warning("response_dom() DEPRECATED, use response.dom instead")
 
         if not self._response_dom:
             dom = None
@@ -272,18 +343,17 @@ class BaseConnection(object):
             try:
                 if self.response.content:
                     regex = re.compile(b'xmlns="[^"]+"')
-                    content = regex.sub(b'', self.response.content)
+                    content = regex.sub(b"", self.response.content)
                 else:
-                    content = "<%sResponse></%sResponse>" % (
-                        self.verb, self.verb)
+                    content = "<%sResponse></%sResponse>" % (self.verb, self.verb)
 
                 dom = parseString(content)
-                self._response_dom = dom.getElementsByTagName(
-                    self.verb + 'Response')[0]
+                self._response_dom = dom.getElementsByTagName(self.verb + "Response")[0]
 
             except ExpatError as e:
                 raise ConnectionResponseError(
-                    "Invalid Verb: %s (%s)" % (self.verb, e), self.response)
+                    "Invalid Verb: %s (%s)" % (self.verb, e), self.response
+                )
             except IndexError:
                 self._response_dom = dom
 
@@ -292,13 +362,14 @@ class BaseConnection(object):
     def response_dict(self):
         "Returns the response dictionary."
         log.warning(
-            'response_dict() DEPRECATED, use response.dict() or response.reply instead')
+            "response_dict() DEPRECATED, use response.dict() or response.reply instead"
+        )
 
         return self.response.reply
 
     def response_json(self):
         "Returns the response JSON."
-        log.warning('response_json() DEPRECATED, use response.json() instead')
+        log.warning("response_json() DEPRECATED, use response.json() instead")
 
         return self.response.json()
 
@@ -337,12 +408,13 @@ class BaseConnection(object):
         if len(error_array) > 0:
             # Force all errors to be unicode in a proper way
             error_array = [smart_decode(smart_encode(e)) for e in error_array]
-            error_string = u"{verb}: {message}".format(
-                verb=self.verb, message=u", ".join(error_array))
+            error_string = "{verb}: {message}".format(
+                verb=self.verb, message=", ".join(error_array)
+            )
 
             return error_string
 
         return None
 
     def opendoc(self):
-        webbrowser.open(self.config.get('doc_url'))
+        webbrowser.open(self.config.get("doc_url"))
