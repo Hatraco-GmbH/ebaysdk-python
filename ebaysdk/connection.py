@@ -24,7 +24,7 @@ from requests.adapters import HTTPAdapter
 from ebaysdk import UserAgent, log, set_stream_logger
 from ebaysdk.exception import ConnectionError, ConnectionResponseError
 from ebaysdk.response import Response
-from ebaysdk.utils import getNodeText as getNodeTextUtils
+from ebaysdk.utils import getNodeText as getNodeTextUtils, smart_encode_request_data
 from ebaysdk.utils import (
     getValue,
     smart_decode,
@@ -177,7 +177,7 @@ class BaseConnection(object):
         request = Request(
             self.method,
             url,
-            data=requestData,
+            data=smart_encode_request_data(requestData),
             headers=headers,
             files=files,
         )
